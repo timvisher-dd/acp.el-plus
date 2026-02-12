@@ -104,6 +104,7 @@ functions for advanced customization or testing."
     (error "Client already started"))
   (let* ((pending-input "")
          (message-queue nil)
+         (message-queue-tail nil)
          (message-queue-busy nil)
          (process-environment (append (map-elt client :environment-variables)
                                       process-environment))
@@ -147,9 +148,13 @@ functions for advanced customization or testing."
                                                           (error
                                                            (acp--log client "JSON PARSE ERROR" "Invalid JSON: %s" json)
                                                            nil))))
-                                      (setq message-queue
-                                            (append message-queue
-                                                    (list (acp--make-message :json json :object object))))
+                                      (let ((message (acp--make-message :json json :object object)))
+                                        (if message-queue
+                                            (progn
+                                              (setcdr message-queue-tail (list message))
+                                              (setq message-queue-tail (cdr message-queue-tail)))
+                                          (setq message-queue (list message))
+                                          (setq message-queue-tail message-queue)))
                                       (unless message-queue-busy
                                         (setq message-queue-busy t)
                                         (run-at-time 0 nil
@@ -176,6 +181,7 @@ functions for advanced customization or testing."
                                                                   (error
                                                                    (acp--log client "REQUEST HANDLER ERROR"
                                                                              "Failed with error: %S" err))))))))
+                                                       (setq message-queue-tail nil)
                                                        (setq message-queue-busy nil))))))
                                   (setq start (1+ pos)))
                                 (setq pending-input (substring pending-input start))))
@@ -427,7 +433,9 @@ When non-nil SYNC, send notification synchronously."
 (cl-defun acp-make-initialize-request (&key protocol-version
                                             client-info
                                             read-text-file-capability
-                                            write-text-file-capability)
+                                            write-text-file-capability
+                                            terminal-capability
+                                            meta-capabilities)
   "Instantiate an \"initialize\" request.
 
 PROTOCOL-VERSION is the version of the ACP protocol to use.
@@ -437,21 +445,34 @@ READ-TEXT-FILE-CAPABILITY is a boolean indicating if the client
 can read text files.
 WRITE-TEXT-FILE-CAPABILITY is a boolean indicating if the client
 can write text files.
+TERMINAL-CAPABILITY is a boolean (or :false) indicating if the client
+supports terminal output streaming.
+META-CAPABILITIES is an alist of additional client capabilities to send
+under the \"_meta\" key.
 
 See https://agentclientprotocol.com/protocol/schema#initializerequest
 and https://agentclientprotocol.com/protocol/schema#initializeresponse."
   (unless protocol-version
     (error ":protocol-version is required"))
-  `((:method . "initialize")
-    (:params . (,@(when client-info
-                    `((clientInfo . ,client-info)))
-                (protocolVersion . ,protocol-version)
-                (clientCapabilities . ((fs . ((readTextFile . ,(if read-text-file-capability
+  (let ((terminal-value (cond
+                         ((eq terminal-capability :false) :false)
+                         (terminal-capability t)
+                         (t nil))))
+    `((:method . "initialize")
+      (:params . (,@(when client-info
+                      `((clientInfo . ,client-info)))
+                  (protocolVersion . ,protocol-version)
+                  (clientCapabilities . ((fs . ((readTextFile . ,(if read-text-file-capability
                                                                    t
                                                                  :false))
-                                              (writeTextFile . ,(if write-text-file-capability
-                                                                    t
-                                                                  :false))))))))))
+                                                (writeTextFile . ,(if write-text-file-capability
+                                                                      t
+                                                                    :false))))
+                                           ,@(when terminal-value
+                                               `((terminal . ,terminal-value)))
+                                           ,@(when meta-capabilities
+                                               `((_meta . ,meta-capabilities))))))))))
+
 
 (cl-defun acp-make-authenticate-request (&key method-id method)
   "Instantiate an \"authenticate\" request.
