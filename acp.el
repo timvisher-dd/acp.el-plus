@@ -46,6 +46,10 @@
 
 (defvar acp-logging-enabled nil)
 
+(defvar acp--clients nil
+  "List of all live ACP clients.
+`acp-make-client' registers new clients and `acp-shutdown' deregisters them.")
+
 (defvar acp-instance-count 0)
 
 (cl-defun acp-make-client (&key context-buffer command command-params environment-variables
@@ -77,22 +81,24 @@ If the decorator returns nil, the original request is sent and
 the error is logged."
   (unless command
     (error ":command is required"))
-  (list (cons :context-buffer context-buffer)
-        (cons :instance-count (acp--increment-instance-count))
-        (cons :process nil)
-        (cons :command command)
-        (cons :command-params command-params)
-        (cons :environment-variables environment-variables)
-        (cons :pending-requests ())
-        (cons :request-id 0)
-        (cons :notification-handlers ())
-        (cons :request-handlers ())
-        (cons :error-handlers ())
-        (cons :request-sender (or request-sender #'acp--request-sender))
-        (cons :notification-sender (or notification-sender #'acp--notification-sender))
-        (cons :request-resolver (or request-resolver #'acp--request-resolver))
-        (cons :response-sender (or response-sender #'acp--response-sender))
-        (cons :outgoing-request-decorator outgoing-request-decorator)))
+  (let ((client (list (cons :context-buffer context-buffer)
+                      (cons :instance-count (acp--increment-instance-count))
+                      (cons :process nil)
+                      (cons :command command)
+                      (cons :command-params command-params)
+                      (cons :environment-variables environment-variables)
+                      (cons :pending-requests ())
+                      (cons :request-id 0)
+                      (cons :notification-handlers ())
+                      (cons :request-handlers ())
+                      (cons :error-handlers ())
+                      (cons :request-sender (or request-sender #'acp--request-sender))
+                      (cons :notification-sender (or notification-sender #'acp--notification-sender))
+                      (cons :request-resolver (or request-resolver #'acp--request-resolver))
+                      (cons :response-sender (or response-sender #'acp--response-sender))
+                      (cons :outgoing-request-decorator outgoing-request-decorator))))
+    (push client acp--clients)
+    client))
 
 (defun acp--client-started-p (client)
   "Return non-nil if CLIENT process has been started."
@@ -116,13 +122,9 @@ the error is logged."
          (message-queue-busy nil)
          (process-environment (append (map-elt client :environment-variables)
                                       process-environment))
-         (stderr-buffer (get-buffer-create (format "acp-client-stderr(%s)-%s"
-                                                   (map-elt client :command)
-                                                   (map-elt client :instance-count))))
+         (stderr-buffer (acp-stderr-buffer :client client))
          (stderr-proc (make-pipe-process
-                       :name (format "acp-client-stderr(%s)-%s"
-                                     (map-elt client :command)
-                                     (map-elt client :instance-count))
+                       :name (buffer-name stderr-buffer)
                        :buffer stderr-buffer
                        :noquery t
                        :filter (lambda (_process raw-output)
@@ -201,9 +203,7 @@ the error is logged."
                                 (setq pending-input (substring pending-input start))))
                     :sentinel (lambda (_process _event)
                                 (when (process-live-p stderr-proc)
-                                  (delete-process stderr-proc))
-                                (when (buffer-live-p stderr-buffer)
-                                  (kill-buffer stderr-buffer))))))
+                                  (delete-process stderr-proc))))))
       (map-put! client :process process))))
 
 (cl-defun acp-subscribe-to-notifications (&key client on-notification buffer)
@@ -287,7 +287,10 @@ Note: These are agent process errors.
         (when (process-live-p (map-elt client :process))
           (delete-process (map-elt client :process)))
         (kill-buffer (acp-logs-buffer :client client))
-        (kill-buffer (acp-traffic-buffer :client client)))
+        (kill-buffer (acp-traffic-buffer :client client))
+        (when (buffer-live-p (acp-stderr-buffer :client client))
+          (kill-buffer (acp-stderr-buffer :client client)))
+        (setq acp--clients (delq client acp--clients)))
     (message "Client already shut down")))
 
 (cl-defun acp-send-request (&key client request buffer on-success on-failure sync)
@@ -904,6 +907,8 @@ DIRECTION is either `incoming' or `outgoing', OBJECT is the parsed object."
   (with-current-buffer (acp-logs-buffer :client client)
     (erase-buffer))
   (with-current-buffer (acp-traffic-buffer :client client)
+    (erase-buffer))
+  (with-current-buffer (acp-stderr-buffer :client client)
     (erase-buffer)))
 
 (cl-defun acp-logs-buffer (&key client)
@@ -923,6 +928,101 @@ DIRECTION is either `incoming' or `outgoing', OBJECT is the parsed object."
   (acp-traffic-get-buffer :named (format "*acp-(%s)-%s traffic*"
                                          (map-elt client :command)
                                          (map-elt client :instance-count))))
+
+(cl-defun acp-stderr-buffer (&key client)
+  "Get CLIENT stderr buffer."
+  (if-let* ((name
+             (format "*acp-(%s)-%s stderr*"
+                     (map-elt client :command)
+                     (map-elt client :instance-count)))
+            (buffer (get-buffer name)))
+      buffer
+    (with-current-buffer (get-buffer-create name)
+      (buffer-disable-undo)
+      (current-buffer))))
+
+(defun acp--client-label (client)
+  "Return a human-readable label for CLIENT."
+  (format "%s-%s"
+          (map-elt client :command)
+          (map-elt client :instance-count)))
+
+(defun acp--select-client ()
+  "Select a client from `acp--clients'.
+If one client exists, return it.  If multiple, prompt with `completing-read'."
+  (let ((live-clients (seq-filter
+                       (lambda (client)
+                         (or (acp--client-started-p client)
+                             (buffer-live-p (acp-logs-buffer :client client))
+                             (buffer-live-p (acp-traffic-buffer :client client))))
+                       acp--clients)))
+    (pcase (length live-clients)
+      (0 (error "No live ACP clients found"))
+      (1 (car live-clients))
+      (_ (let* ((labels (mapcar (lambda (c)
+                                  (cons (acp--client-label c) c))
+                                live-clients))
+                (choice (completing-read "Select ACP client: "
+                                         (mapcar #'car labels) nil t)))
+           (cdr (assoc choice labels)))))))
+
+(defun acp--save-buffer-to-file (buffer file)
+  "Write contents of BUFFER to FILE if BUFFER is live and non-empty."
+  (when (and (buffer-live-p buffer)
+             (< 0 (buffer-size buffer)))
+    (with-current-buffer buffer
+      (save-restriction
+        (widen)
+        (write-region (point-min) (point-max) file)))
+    t))
+
+(cl-defun acp-debug-save-to (&key client directory)
+  "Save all debug buffers for CLIENT to DIRECTORY.
+When called interactively, select client from `acp--clients' and
+prompt for directory.  When called programmatically, both CLIENT
+and DIRECTORY are required.
+
+Writes the following files:
+  log.txt      - raw log buffer contents
+  stderr.txt   - raw stderr buffer contents
+  traffic.txt  - raw traffic buffer contents
+  traffic.eld  - structured traffic objects (Emacs Lisp readable)"
+  (interactive
+   (list :client (acp--select-client)
+         :directory (read-directory-name "Save debug logs to: "
+                                          (expand-file-name
+                                           (format "acp-debug-%s/"
+                                                   (format-time-string "%Y%m%d-%H%M%S"))
+                                           temporary-file-directory))))
+  (unless client
+    (error ":client is required"))
+  (unless directory
+    (error ":directory is required"))
+  (let ((directory (file-name-as-directory (expand-file-name directory)))
+        (saved-files nil))
+    (make-directory directory t)
+    (when (acp--save-buffer-to-file (acp-logs-buffer :client client)
+                                     (expand-file-name "log.txt" directory))
+      (push "log.txt" saved-files))
+    (when (acp--save-buffer-to-file (acp-stderr-buffer :client client)
+                                     (expand-file-name "stderr.txt" directory))
+      (push "stderr.txt" saved-files))
+    (when (acp--save-buffer-to-file (acp-traffic-buffer :client client)
+                                     (expand-file-name "traffic.txt" directory))
+      (push "traffic.txt" saved-files))
+    (let ((traffic-buffer (acp-traffic-buffer :client client)))
+      (when (and (buffer-live-p traffic-buffer)
+                 (< 0 (buffer-size traffic-buffer)))
+        (when-let ((objects (with-current-buffer traffic-buffer
+                              (acp-traffic--objects))))
+          (with-temp-file (expand-file-name "traffic.eld" directory)
+            (let ((print-circle t))
+              (pp objects (current-buffer))))
+          (push "traffic.eld" saved-files))))
+    (if saved-files
+        (message "Saved %s to %s" (string-join (nreverse saved-files) ", ") directory)
+      (message "No debug data to save"))
+    directory))
 
 (defun acp--increment-instance-count ()
   "Increment variable `acp-instance-count'."
